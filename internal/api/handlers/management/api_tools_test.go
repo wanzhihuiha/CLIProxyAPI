@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -208,5 +209,177 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 	}
 	if gotCompat.ID != compatAuth.ID {
 		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
+	}
+}
+
+func TestAPICallWhamUsageUpdatesCodexAccountQuota(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "codex-auth", Provider: "codex", Metadata: map[string]any{"email": "user@example.com"}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	targetURL, errParse := url.Parse("https://chatgpt.com/backend-api/wham/usage?include=usage")
+	if errParse != nil {
+		t.Fatalf("parse url: %v", errParse)
+	}
+
+	h := &Handler{authManager: manager}
+	changed := h.maybeUpdateCodexWhamUsageQuota(
+		context.Background(),
+		http.MethodGet,
+		targetURL,
+		auth,
+		http.Header{"Chatgpt-Account-Id": {"acct-header"}},
+		http.StatusOK,
+		[]byte(`{"account_id":"acct-body","user_id":"user-body","email":"codex@example.com","rate_limit":{"primary_window":{"used_percent":25},"secondary_window":{"used_percent":40}}}`),
+	)
+	if !changed {
+		t.Fatal("expected codex quota snapshot update")
+	}
+
+	updated, _ := manager.GetByID("codex-auth")
+	if !updated.Quota.FiveHourRemainingKnown || updated.Quota.FiveHourRemainingPercent != 75 {
+		t.Fatalf("5h quota = (%v, %v), want known 75", updated.Quota.FiveHourRemainingKnown, updated.Quota.FiveHourRemainingPercent)
+	}
+	if !updated.Quota.SevenDayRemainingKnown || updated.Quota.SevenDayRemainingPercent != 60 {
+		t.Fatalf("7d quota = (%v, %v), want known 60", updated.Quota.SevenDayRemainingKnown, updated.Quota.SevenDayRemainingPercent)
+	}
+	if len(updated.ModelStates) != 0 {
+		t.Fatalf("model states changed: %#v", updated.ModelStates)
+	}
+	if got := updated.Metadata["codex_account_id"]; got != "acct-header" {
+		t.Fatalf("codex_account_id = %#v, want acct-header", got)
+	}
+	if got := updated.Metadata["codex_user_id"]; got != "user-body" {
+		t.Fatalf("codex_user_id = %#v, want user-body", got)
+	}
+	if got := updated.Metadata["email"]; got != "codex@example.com" {
+		t.Fatalf("email = %#v, want codex@example.com", got)
+	}
+}
+
+func TestAPICallWhamUsageSavesResponseIdentityWithoutHeader(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "codex-auth", Provider: "codex", Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	targetURL, errParse := url.Parse("https://chatgpt.com/backend-api/wham/usage")
+	if errParse != nil {
+		t.Fatalf("parse url: %v", errParse)
+	}
+
+	h := &Handler{authManager: manager}
+	changed := h.maybeUpdateCodexWhamUsageQuota(
+		context.Background(),
+		http.MethodGet,
+		targetURL,
+		auth,
+		nil,
+		http.StatusOK,
+		[]byte(`{"account":{"account_id":"acct-body","user_id":"user-body","email":"codex@example.com"},"rate_limit":{"primary_window":{"used_percent":30}}}`),
+	)
+	if !changed {
+		t.Fatal("expected codex quota snapshot update")
+	}
+
+	updated, _ := manager.GetByID("codex-auth")
+	if got := updated.Metadata["codex_account_id"]; got != "acct-body" {
+		t.Fatalf("codex_account_id = %#v, want acct-body", got)
+	}
+	if got := updated.Metadata["codex_user_id"]; got != "user-body" {
+		t.Fatalf("codex_user_id = %#v, want user-body", got)
+	}
+	if got := updated.Metadata["email"]; got != "codex@example.com" {
+		t.Fatalf("email = %#v, want codex@example.com", got)
+	}
+}
+
+func TestAPICallWhamUsageSkipsNonMatchingRequests(t *testing.T) {
+	t.Parallel()
+
+	validURL, errParse := url.Parse("https://chatgpt.com/backend-api/wham/usage")
+	if errParse != nil {
+		t.Fatalf("parse valid url: %v", errParse)
+	}
+	otherPathURL, errParse := url.Parse("https://chatgpt.com/backend-api/other")
+	if errParse != nil {
+		t.Fatalf("parse other path url: %v", errParse)
+	}
+
+	tests := []struct {
+		name       string
+		method     string
+		targetURL  *url.URL
+		provider   string
+		statusCode int
+		body       []byte
+	}{
+		{
+			name:       "non get method",
+			method:     http.MethodPost,
+			targetURL:  validURL,
+			provider:   "codex",
+			statusCode: http.StatusOK,
+			body:       []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`),
+		},
+		{
+			name:       "non wham path",
+			method:     http.MethodGet,
+			targetURL:  otherPathURL,
+			provider:   "codex",
+			statusCode: http.StatusOK,
+			body:       []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`),
+		},
+		{
+			name:       "non codex auth",
+			method:     http.MethodGet,
+			targetURL:  validURL,
+			provider:   "gemini",
+			statusCode: http.StatusOK,
+			body:       []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`),
+		},
+		{
+			name:       "non ok status",
+			method:     http.MethodGet,
+			targetURL:  validURL,
+			provider:   "codex",
+			statusCode: http.StatusTooManyRequests,
+			body:       []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`),
+		},
+		{
+			name:       "parser rejected",
+			method:     http.MethodGet,
+			targetURL:  validURL,
+			provider:   "codex",
+			statusCode: http.StatusOK,
+			body:       []byte(`{"rate_limit":{"primary_window":{"used_percent":"25"}}}`),
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			manager := coreauth.NewManager(nil, nil, nil)
+			auth := &coreauth.Auth{ID: "auth-a", Provider: tc.provider, Metadata: map[string]any{"email": "user@example.com"}}
+			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+			h := &Handler{authManager: manager}
+
+			if changed := h.maybeUpdateCodexWhamUsageQuota(context.Background(), tc.method, tc.targetURL, auth, nil, tc.statusCode, tc.body); changed {
+				t.Fatal("did not expect codex quota snapshot update")
+			}
+			updated, _ := manager.GetByID("auth-a")
+			if updated.Quota.FiveHourRemainingKnown || updated.Quota.SevenDayRemainingKnown {
+				t.Fatalf("quota changed: %#v", updated.Quota)
+			}
+		})
 	}
 }

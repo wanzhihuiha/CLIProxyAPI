@@ -89,6 +89,496 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 	}
 }
 
+func TestStickyQuotaProtectSelectorPick_PrefersFiveHourQuotaBucket(t *testing.T) {
+	t.Parallel()
+
+	selector := &StickyQuotaProtectSelector{}
+	auths := []*Auth{
+		{ID: "medium", Quota: quotaSnapshotForTest(45, 80)},
+		{ID: "high-b", Quota: quotaSnapshotForTest(90, 80)},
+		{ID: "high-a", Quota: quotaSnapshotForTest(70, 80)},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "high-b" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "high-b")
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_FiltersLowFiveHourQuota(t *testing.T) {
+	t.Parallel()
+
+	selector := &StickyQuotaProtectSelector{}
+	auths := []*Auth{
+		{ID: "low", Quota: quotaSnapshotForTest(4, 80)},
+		{ID: "usable", Quota: quotaSnapshotForTest(30, 80)},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "usable" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "usable")
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_SevenDayQuotaPenalizesWithinFiveHourBucket(t *testing.T) {
+	t.Parallel()
+
+	selector := &StickyQuotaProtectSelector{}
+	auths := []*Auth{
+		{ID: "short-high-week-low", Quota: quotaSnapshotForTest(90, 15)},
+		{ID: "short-high-week-healthy", Quota: quotaSnapshotForTest(85, 80)},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "short-high-week-healthy" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "short-high-week-healthy")
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_PriorityDoesNotOverrideQuota(t *testing.T) {
+	t.Parallel()
+
+	selector := &StickyQuotaProtectSelector{}
+	auths := []*Auth{
+		{ID: "high-priority-low-quota", Attributes: map[string]string{"priority": "10"}, Quota: quotaSnapshotForTest(20, 80)},
+		{ID: "low-priority-high-quota", Attributes: map[string]string{"priority": "0"}, Quota: quotaSnapshotForTest(90, 80)},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "low-priority-high-quota" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "low-priority-high-quota")
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_UnknownSnapshotIsDeprioritizedButUsable(t *testing.T) {
+	t.Parallel()
+
+	selector := &StickyQuotaProtectSelector{}
+	auths := []*Auth{
+		{ID: "unknown"},
+		{ID: "known-low", Quota: quotaSnapshotForTest(20, 80)},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "known-low" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "known-low")
+	}
+
+	got, err = selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, []*Auth{{ID: "unknown-only"}})
+	if err != nil {
+		t.Fatalf("Pick() unknown-only error = %v", err)
+	}
+	if got == nil || got.ID != "unknown-only" {
+		t.Fatalf("Pick() unknown-only auth = %v, want unknown-only", got)
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_FreshSnapshotBeatsStaleHigherQuota(t *testing.T) {
+	t.Parallel()
+
+	selector := &StickyQuotaProtectSelector{}
+	auths := []*Auth{
+		{ID: "stale-high", Quota: quotaSnapshotAtForTest(90, 90, time.Now().Add(-20*time.Minute))},
+		{ID: "fresh-low", Quota: quotaSnapshotForTest(20, 80)},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "fresh-low" {
+		t.Fatalf("Pick() auth = %v, want fresh-low", got)
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_ExpiredSnapshotDoesNotAcceptNewSession(t *testing.T) {
+	t.Parallel()
+
+	selector := &StickyQuotaProtectSelector{}
+	expired := quotaSnapshotAtForTest(90, 80, time.Now().Add(-31*time.Minute))
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, []*Auth{
+		{ID: "expired", Quota: expired},
+		{ID: "unknown"},
+	})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "unknown" {
+		t.Fatalf("Pick() auth = %v, want unknown", got)
+	}
+
+	if got, err = selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, []*Auth{{ID: "expired", Quota: expired}}); err == nil || got != nil {
+		t.Fatalf("Pick() all expired = (%v, %v), want error and nil auth", got, err)
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_ModelQuotaOverridesAuthQuota(t *testing.T) {
+	t.Parallel()
+
+	selector := &StickyQuotaProtectSelector{}
+	auths := []*Auth{
+		{
+			ID:    "auth-quota-high-model-low",
+			Quota: quotaSnapshotForTest(90, 80),
+			ModelStates: map[string]*ModelState{
+				"gemini-pro": {Quota: quotaSnapshotForTest(4, 80)},
+			},
+		},
+		{
+			ID:    "auth-quota-medium-model-healthy",
+			Quota: quotaSnapshotForTest(40, 80),
+			ModelStates: map[string]*ModelState{
+				"gemini-pro": {Quota: quotaSnapshotForTest(70, 80)},
+			},
+		},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "gemini-pro", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "auth-quota-medium-model-healthy" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "auth-quota-medium-model-healthy")
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_MaxNewSessionsFiltersFullAccount(t *testing.T) {
+	t.Parallel()
+
+	activeSessions := NewActiveSessionTracker(ActiveSessionConfig{})
+	seedActiveSessionsForTest(t, activeSessions, "full", stickyQuotaMaxNewSessionsPerAccount)
+	selector := NewStickyQuotaProtectSelector(activeSessions)
+	auths := []*Auth{
+		{ID: "full", Quota: quotaSnapshotForTest(95, 90)},
+		{ID: "open", Quota: quotaSnapshotForTest(45, 80)},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "open" {
+		t.Fatalf("Pick() auth = %v, want open", got)
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_NormalCandidateDisablesOverflow(t *testing.T) {
+	t.Parallel()
+
+	activeSessions := NewActiveSessionTracker(ActiveSessionConfig{})
+	seedActiveSessionsForTest(t, activeSessions, "overflow-ready", stickyQuotaMaxNewSessionsPerAccount)
+	selector := NewStickyQuotaProtectSelector(activeSessions)
+	auths := []*Auth{
+		{ID: "overflow-ready", Quota: quotaSnapshotForTest(95, 90)},
+		{ID: "normal", Quota: quotaSnapshotForTest(45, 80)},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "normal" {
+		t.Fatalf("Pick() auth = %v, want normal", got)
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_AllFullAllowsHealthyOverflow(t *testing.T) {
+	t.Parallel()
+
+	activeSessions := NewActiveSessionTracker(ActiveSessionConfig{})
+	seedActiveSessionsForTest(t, activeSessions, "healthy-overflow", stickyQuotaMaxNewSessionsPerAccount)
+	seedActiveSessionsForTest(t, activeSessions, "medium-overflow", stickyQuotaMaxNewSessionsPerAccount)
+	selector := NewStickyQuotaProtectSelector(activeSessions)
+	auths := []*Auth{
+		{ID: "healthy-overflow", Quota: quotaSnapshotForTest(95, 90)},
+		{ID: "medium-overflow", Quota: quotaSnapshotForTest(45, 80)},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "healthy-overflow" {
+		t.Fatalf("Pick() auth = %v, want healthy-overflow", got)
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_OverflowRejectsLowUnknownAndExpiredSnapshots(t *testing.T) {
+	t.Parallel()
+
+	activeSessions := NewActiveSessionTracker(ActiveSessionConfig{})
+	seedActiveSessionsForTest(t, activeSessions, "low-five-hour", stickyQuotaMaxNewSessionsPerAccount)
+	seedActiveSessionsForTest(t, activeSessions, "low-seven-day", stickyQuotaMaxNewSessionsPerAccount)
+	seedActiveSessionsForTest(t, activeSessions, "unknown", stickyQuotaMaxNewSessionsPerAccount)
+	seedActiveSessionsForTest(t, activeSessions, "expired", stickyQuotaMaxNewSessionsPerAccount)
+	selector := NewStickyQuotaProtectSelector(activeSessions)
+	auths := []*Auth{
+		{ID: "low-five-hour", Quota: quotaSnapshotForTest(55, 80)},
+		{ID: "low-seven-day", Quota: quotaSnapshotForTest(90, 45)},
+		{ID: "unknown"},
+		{ID: "expired", Quota: quotaSnapshotAtForTest(95, 90, time.Now().Add(-31*time.Minute))},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err == nil || got != nil {
+		t.Fatalf("Pick() = (%v, %v), want error and nil auth", got, err)
+	}
+}
+
+func TestSessionAffinitySelector_StickyQuotaProtectCacheHitSurvivesMaxNewSessionsLimit(t *testing.T) {
+	t.Parallel()
+
+	activeSessions := NewActiveSessionTracker(ActiveSessionConfig{
+		IdleTimeout: time.Hour,
+		HardTTL:     time.Hour,
+	})
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:       NewStickyQuotaProtectSelector(activeSessions),
+		TTL:            time.Minute,
+		ActiveSessions: activeSessions,
+	})
+	defer selector.Stop()
+
+	authA := &Auth{ID: "auth-a", Quota: quotaSnapshotForTest(95, 90)}
+	authB := &Auth{ID: "auth-b", Quota: quotaSnapshotForTest(90, 80)}
+	auths := []*Auth{authA, authB}
+	firstOpts := cliproxyexecutor.Options{
+		Headers:  sessionHeadersForTest("sticky-max-session"),
+		Metadata: map[string]any{},
+	}
+
+	first, err := selector.Pick(context.Background(), "gemini", "model", firstOpts, auths)
+	if err != nil {
+		t.Fatalf("first Pick() error = %v", err)
+	}
+	if first == nil || first.ID != "auth-a" {
+		t.Fatalf("first Pick() auth = %v, want auth-a", first)
+	}
+	releaseActiveSessionLease(takeActiveSessionLeaseFromMetadata(firstOpts.Metadata))
+
+	seedActiveSessionsForTest(t, activeSessions, "auth-a", stickyQuotaMaxNewSessionsPerAccount-1)
+	secondOpts := cliproxyexecutor.Options{
+		Headers:  sessionHeadersForTest("sticky-max-session"),
+		Metadata: map[string]any{},
+	}
+	second, err := selector.Pick(context.Background(), "gemini", "model", secondOpts, auths)
+	if err != nil {
+		t.Fatalf("second Pick() error = %v", err)
+	}
+	defer releaseActiveSessionLease(takeActiveSessionLeaseFromMetadata(secondOpts.Metadata))
+	if second == nil || second.ID != "auth-a" {
+		t.Fatalf("second Pick() auth = %v, want sticky auth-a", second)
+	}
+}
+
+func TestSessionAffinitySelector_StickyQuotaProtectCacheHitIgnoresPriorityAndQuota(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &StickyQuotaProtectSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	stickyAuth := &Auth{ID: "low-priority-high-quota", Attributes: map[string]string{"priority": "0"}, Quota: quotaSnapshotForTest(90, 80)}
+	priorityAuth := &Auth{ID: "high-priority-low-quota", Attributes: map[string]string{"priority": "10"}, Quota: quotaSnapshotForTest(20, 80)}
+	auths := []*Auth{priorityAuth, stickyAuth}
+	opts := cliproxyexecutor.Options{
+		Headers: sessionHeadersForTest("sticky-priority-quota-session"),
+	}
+
+	first, err := selector.Pick(context.Background(), "gemini", "model", opts, auths)
+	if err != nil {
+		t.Fatalf("first Pick() error = %v", err)
+	}
+	if first == nil || first.ID != "low-priority-high-quota" {
+		t.Fatalf("first Pick() auth = %v, want low-priority-high-quota", first)
+	}
+
+	stickyAuth.Quota = quotaSnapshotForTest(1, 80)
+	second, err := selector.Pick(context.Background(), "gemini", "model", opts, auths)
+	if err != nil {
+		t.Fatalf("second Pick() error = %v", err)
+	}
+	if second == nil || second.ID != "low-priority-high-quota" {
+		t.Fatalf("second Pick() auth = %v, want cached low-priority-high-quota", second)
+	}
+}
+
+func TestManagerPickNext_StickyQuotaProtectUsesQuotaBeforePriority(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &StickyQuotaProtectSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	manager := NewManager(nil, selector, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{})
+	_, err := manager.Register(context.Background(), &Auth{
+		ID:         "high-priority-low-quota",
+		Provider:   "test",
+		Attributes: map[string]string{"priority": "10"},
+		Quota:      quotaSnapshotForTest(20, 80),
+	})
+	if err != nil {
+		t.Fatalf("Register() high-priority auth error = %v", err)
+	}
+	_, err = manager.Register(context.Background(), &Auth{
+		ID:         "low-priority-high-quota",
+		Provider:   "test",
+		Attributes: map[string]string{"priority": "0"},
+		Quota:      quotaSnapshotForTest(90, 80),
+	})
+	if err != nil {
+		t.Fatalf("Register() low-priority auth error = %v", err)
+	}
+
+	got, _, err := manager.pickNext(context.Background(), "test", "", cliproxyexecutor.Options{
+		Headers: sessionHeadersForTest("manager-sticky-quota-session"),
+	}, nil)
+	if err != nil {
+		t.Fatalf("pickNext() error = %v", err)
+	}
+	if got == nil || got.ID != "low-priority-high-quota" {
+		t.Fatalf("pickNext() auth = %v, want low-priority-high-quota", got)
+	}
+}
+
+func TestStickyQuotaProtectSelectorPick_StickyHitSurvivesLowQuota(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &StickyQuotaProtectSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	authA := &Auth{ID: "auth-a", Quota: quotaSnapshotForTest(90, 80)}
+	authB := &Auth{ID: "auth-b", Quota: quotaSnapshotForTest(80, 80)}
+	auths := []*Auth{authA, authB}
+	opts := cliproxyexecutor.Options{
+		Headers: sessionHeadersForTest("sticky-quota-session"),
+	}
+
+	first, err := selector.Pick(context.Background(), "gemini", "model", opts, auths)
+	if err != nil {
+		t.Fatalf("first Pick() error = %v", err)
+	}
+	if first == nil || first.ID != "auth-a" {
+		t.Fatalf("first Pick() auth = %v, want auth-a", first)
+	}
+
+	authA.Quota = quotaSnapshotForTest(1, 80)
+	second, err := selector.Pick(context.Background(), "gemini", "model", opts, auths)
+	if err != nil {
+		t.Fatalf("second Pick() error = %v", err)
+	}
+	if second == nil || second.ID != "auth-a" {
+		t.Fatalf("second Pick() auth = %v, want sticky auth-a", second)
+	}
+}
+
+func TestSessionAffinitySelector_StickyQuotaProtectCacheHitSurvivesExpiredSnapshot(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &StickyQuotaProtectSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	authA := &Auth{ID: "auth-a", Quota: quotaSnapshotForTest(90, 80)}
+	authB := &Auth{ID: "auth-b", Quota: quotaSnapshotForTest(80, 80)}
+	auths := []*Auth{authA, authB}
+	opts := cliproxyexecutor.Options{
+		Headers: sessionHeadersForTest("sticky-expired-quota-session"),
+	}
+
+	first, err := selector.Pick(context.Background(), "gemini", "model", opts, auths)
+	if err != nil {
+		t.Fatalf("first Pick() error = %v", err)
+	}
+	if first == nil || first.ID != "auth-a" {
+		t.Fatalf("first Pick() auth = %v, want auth-a", first)
+	}
+
+	authA.Quota = quotaSnapshotAtForTest(1, 80, time.Now().Add(-31*time.Minute))
+	second, err := selector.Pick(context.Background(), "gemini", "model", opts, auths)
+	if err != nil {
+		t.Fatalf("second Pick() error = %v", err)
+	}
+	if second == nil || second.ID != "auth-a" {
+		t.Fatalf("second Pick() auth = %v, want sticky auth-a", second)
+	}
+}
+
+func quotaSnapshotForTest(fiveHour, sevenDay float64) QuotaState {
+	return quotaSnapshotAtForTest(fiveHour, sevenDay, time.Now())
+}
+
+func quotaSnapshotAtForTest(fiveHour, sevenDay float64, updatedAt time.Time) QuotaState {
+	return QuotaState{
+		FiveHourRemainingKnown:   true,
+		FiveHourRemainingPercent: fiveHour,
+		SevenDayRemainingKnown:   true,
+		SevenDayRemainingPercent: sevenDay,
+		SnapshotUpdatedAt:        updatedAt,
+	}
+}
+
+func seedActiveSessionsForTest(t *testing.T, tracker *ActiveSessionTracker, authID string, count int) {
+	t.Helper()
+	now := time.Now()
+	for i := 0; i < count; i++ {
+		sessionKey := fmt.Sprintf("seed-active-session-%s-%d", authID, i)
+		if lease := tracker.Begin(sessionKey, authID, now); lease == nil {
+			t.Fatalf("Begin(%q, %q) returned nil lease", sessionKey, authID)
+		}
+	}
+}
+
+func sessionHeadersForTest(sessionID string) http.Header {
+	headers := http.Header{}
+	headers.Set("X-Session-ID", sessionID)
+	return headers
+}
+
 func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	t.Parallel()
 

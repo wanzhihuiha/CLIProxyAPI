@@ -60,6 +60,7 @@ VisionCoder is also offering our users a limited-time <a href="https://coder.vis
 - Gemini CLI multi-account load balancing
 - Claude Code multi-account load balancing
 - OpenAI Codex multi-account load balancing
+- Quota-aware sticky routing for Codex account pools via `sticky-quota-protect`
 - Grok Build multi-account load balancing
 - OpenAI-compatible upstream providers via config (e.g., OpenRouter)
 - Reusable Go SDK for embedding the proxy (see `docs/sdk-usage.md`)

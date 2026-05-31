@@ -209,11 +209,53 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	h.maybeUpdateCodexWhamUsageQuota(c.Request.Context(), method, parsedURL, auth, req.Header, resp.StatusCode, respBody)
+
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+func (h *Handler) maybeUpdateCodexWhamUsageQuota(ctx context.Context, method string, targetURL *url.URL, auth *coreauth.Auth, reqHeaders http.Header, statusCode int, respBody []byte) bool {
+	if h == nil || h.authManager == nil || !isCodexWhamUsageQuotaCandidate(method, targetURL, auth, statusCode) {
+		return false
+	}
+	update, ok := coreauth.ParseCodexWhamUsageQuotaSnapshot(respBody)
+	if !ok {
+		return false
+	}
+
+	metadata := coreauth.ParseCodexWhamUsageMetadata(reqHeaders, respBody)
+	changed, errUpdate := h.authManager.UpdateAccountQuotaSnapshotWithMetadata(ctx, auth.ID, update, metadata)
+	entry := log.WithFields(log.Fields{
+		"auth_id":  auth.ID,
+		"provider": auth.Provider,
+		"source":   update.Source,
+	})
+	if errUpdate != nil {
+		entry.WithError(errUpdate).Warn("failed to persist codex quota snapshot from wham usage")
+	}
+	if changed {
+		entry.WithFields(log.Fields{
+			"five_hour_remaining_known":   update.FiveHourRemainingKnown,
+			"five_hour_remaining_percent": update.FiveHourRemainingPercent,
+			"seven_day_remaining_known":   update.SevenDayRemainingKnown,
+			"seven_day_remaining_percent": update.SevenDayRemainingPercent,
+		}).Debug("updated codex quota snapshot from wham usage")
+	}
+	return changed
+}
+
+func isCodexWhamUsageQuotaCandidate(method string, targetURL *url.URL, auth *coreauth.Auth, statusCode int) bool {
+	if statusCode != http.StatusOK || !strings.EqualFold(strings.TrimSpace(method), http.MethodGet) {
+		return false
+	}
+	if targetURL == nil || !strings.EqualFold(strings.TrimSpace(targetURL.Hostname()), "chatgpt.com") || targetURL.Path != "/backend-api/wham/usage" {
+		return false
+	}
+	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
 }
 
 func firstNonEmptyString(values ...*string) string {

@@ -25,6 +25,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.UsageStatisticsEnabled = false
 	cfg.RedisUsageQueueRetentionSeconds = 60
 	cfg.DisableCooling = false
+	cfg.CodexQuotaRefresh.Enabled = true
+	cfg.CodexQuotaRefresh.Interval = DefaultCodexQuotaRefreshInterval
+	cfg.CodexQuotaRefresh.MaxConcurrency = DefaultCodexQuotaRefreshConcurrency
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
@@ -72,6 +75,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+	cfg.NormalizeCodexQuotaRefreshConfig()
 
 	// Apply the same sanitization pipeline.
 	cfg.SanitizeGeminiKeys()

@@ -361,6 +361,55 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials)
 }
 
+func (s *Service) applyCodexQuotaRefreshConfig(cfg *config.Config) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	if cfg == nil || cfg.Home.Enabled {
+		s.coreManager.StopCodexQuotaRefresh()
+		return
+	}
+	opts := codexQuotaRefreshOptionsFromConfig(cfg)
+	if !opts.Enabled {
+		s.coreManager.StopCodexQuotaRefresh()
+		log.Debug("codex quota refresh worker disabled")
+		return
+	}
+	s.coreManager.StartCodexQuotaRefresh(context.Background(), opts)
+	log.Infof("codex quota refresh worker started (interval=%s max_concurrency=%d)", opts.Interval, opts.MaxConcurrency)
+}
+
+func codexQuotaRefreshOptionsFromConfig(cfg *config.Config) coreauth.CodexQuotaRefreshOptions {
+	if cfg == nil {
+		return coreauth.CodexQuotaRefreshOptions{}
+	}
+	interval := defaultCodexQuotaRefreshIntervalFromConfig(cfg.CodexQuotaRefresh.Interval)
+	maxConcurrency := cfg.CodexQuotaRefresh.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = config.DefaultCodexQuotaRefreshConcurrency
+	}
+	return coreauth.CodexQuotaRefreshOptions{
+		Enabled:        cfg.CodexQuotaRefresh.Enabled,
+		Interval:       interval,
+		MaxConcurrency: maxConcurrency,
+	}
+}
+
+func defaultCodexQuotaRefreshIntervalFromConfig(raw string) time.Duration {
+	interval := config.DefaultCodexQuotaRefreshInterval
+	if strings.TrimSpace(raw) != "" {
+		interval = strings.TrimSpace(raw)
+	}
+	parsed, err := time.ParseDuration(interval)
+	if err != nil || parsed <= 0 {
+		parsed, _ = time.ParseDuration(config.DefaultCodexQuotaRefreshInterval)
+	}
+	if parsed <= 0 {
+		return 10 * time.Minute
+	}
+	return parsed
+}
+
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
 	if a == nil {
 		return "", "", false
@@ -489,8 +538,8 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	var previousSessionAffinityTTL string
 	s.cfgMu.RLock()
 	if s.cfg != nil {
-		previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
-		previousSessionAffinity = s.cfg.Routing.SessionAffinity
+		previousStrategy = normalizeRoutingStrategyName(s.cfg.Routing.Strategy)
+		previousSessionAffinity = effectiveSessionAffinity(previousStrategy, s.cfg.Routing.SessionAffinity)
 		previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
 	}
 	s.cfgMu.RUnlock()
@@ -504,19 +553,8 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		return
 	}
 
-	nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
-	normalizeStrategy := func(strategy string) string {
-		switch strategy {
-		case "fill-first", "fillfirst", "ff":
-			return "fill-first"
-		default:
-			return "round-robin"
-		}
-	}
-	previousStrategy = normalizeStrategy(previousStrategy)
-	nextStrategy = normalizeStrategy(nextStrategy)
-
-	nextSessionAffinity := newCfg.Routing.SessionAffinity
+	nextStrategy := normalizeRoutingStrategyName(newCfg.Routing.Strategy)
+	nextSessionAffinity := effectiveSessionAffinity(nextStrategy, newCfg.Routing.SessionAffinity)
 	nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
 
 	selectorChanged := previousStrategy != nextStrategy ||
@@ -524,28 +562,7 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		previousSessionAffinityTTL != nextSessionAffinityTTL
 
 	if s.coreManager != nil && selectorChanged {
-		var selector coreauth.Selector
-		switch nextStrategy {
-		case "fill-first":
-			selector = &coreauth.FillFirstSelector{}
-		default:
-			selector = &coreauth.RoundRobinSelector{}
-		}
-
-		if nextSessionAffinity {
-			ttl := time.Hour
-			if ttlStr := strings.TrimSpace(nextSessionAffinityTTL); ttlStr != "" {
-				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
-					ttl = parsed
-				}
-			}
-			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback: selector,
-				TTL:      ttl,
-			})
-		}
-
-		s.coreManager.SetSelector(selector)
+		s.coreManager.SetSelector(newRoutingSelector(nextStrategy, nextSessionAffinity, nextSessionAffinityTTL))
 	}
 
 	s.applyRetryConfig(newCfg)
@@ -564,6 +581,7 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		s.registerHomeExecutors()
 	}
 	s.rebindExecutors()
+	s.applyCodexQuotaRefreshConfig(newCfg)
 }
 
 func forceHomeRuntimeConfig(cfg *config.Config) {
@@ -940,6 +958,7 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+		s.applyCodexQuotaRefreshConfig(s.cfg)
 	}
 
 	select {
@@ -990,6 +1009,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			s.watcherCancel()
 		}
 		if s.coreManager != nil {
+			s.coreManager.StopCodexQuotaRefresh()
 			s.coreManager.StopAutoRefresh()
 		}
 		if s.watcher != nil {

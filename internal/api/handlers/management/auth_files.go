@@ -407,8 +407,15 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
+	entry["quota"] = authQuotaEntry(auth.Quota)
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
+	}
+	if accountID := authMetadataString(auth, "codex_account_id"); accountID != "" {
+		entry["codex_account_id"] = accountID
+	}
+	if userID := authMetadataString(auth, "codex_user_id"); userID != "" {
+		entry["codex_user_id"] = userID
 	}
 	if projectID := authProjectID(auth); projectID != "" {
 		entry["project_id"] = projectID
@@ -488,6 +495,37 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		entry["websockets"] = websockets
 	}
 	return entry
+}
+
+func authQuotaEntry(quota coreauth.QuotaState) gin.H {
+	return gin.H{
+		"exceeded":                    quota.Exceeded,
+		"reason":                      quota.Reason,
+		"next_recover_at":             nullableTime(quota.NextRecoverAt),
+		"backoff_level":               quota.BackoffLevel,
+		"five_hour_remaining_known":   quota.FiveHourRemainingKnown,
+		"five_hour_remaining_percent": quota.FiveHourRemainingPercent,
+		"seven_day_remaining_known":   quota.SevenDayRemainingKnown,
+		"seven_day_remaining_percent": quota.SevenDayRemainingPercent,
+		"snapshot_updated_at":         nullableTime(quota.SnapshotUpdatedAt),
+	}
+}
+
+func nullableTime(ts time.Time) any {
+	if ts.IsZero() {
+		return nil
+	}
+	return ts
+}
+
+func authMetadataString(auth *coreauth.Auth, key string) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	if value, ok := auth.Metadata[key].(string); ok {
+		return strings.TrimSpace(value)
+	}
+	return ""
 }
 
 func authWebsocketsValue(auth *coreauth.Auth) (bool, bool) {

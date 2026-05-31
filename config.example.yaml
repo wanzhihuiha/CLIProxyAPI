@@ -108,6 +108,12 @@ disable-image-generation: false
 # When > 0, overrides the default worker count (16).
 # auth-auto-refresh-workers: 16
 
+# Codex account quota snapshot refresh from ChatGPT wham/usage.
+codex-quota-refresh:
+  enabled: true
+  interval: "10m"
+  max-concurrency: 2
+
 # Quota exceeded behavior
 quota-exceeded:
   switch-project: true # Whether to automatically switch to another project when a quota is exceeded
@@ -116,7 +122,7 @@ quota-exceeded:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), fill-first
+  strategy: "round-robin" # round-robin (default), fill-first, sticky-quota-protect
   # Enable universal session-sticky routing for all clients.
   # Session IDs are extracted from: metadata.user_id (Claude Code session format),
   # X-Session-ID, Session_id (Codex), X-Amp-Thread-Id (Amp CLI),

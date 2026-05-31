@@ -60,6 +60,7 @@ VisionCoder 还为我们的用户提供 <a href="https://coder.visioncoder.cn" t
 - 支持 Gemini CLI 多账户轮询
 - 支持 Claude Code 多账户轮询
 - 支持 OpenAI Codex 多账户轮询
+- 支持 Codex 账号池的 `sticky-quota-protect` 配额保护粘性调度
 - 支持 Grok Build 多账户轮询
 - 通过配置接入上游 OpenAI 兼容提供商（例如 OpenRouter）
 - 可复用的 Go SDK（见 `docs/sdk-usage_CN.md`）

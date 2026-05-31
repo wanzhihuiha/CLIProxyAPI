@@ -131,6 +131,16 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+	// FiveHourRemainingKnown indicates whether FiveHourRemainingPercent is populated.
+	FiveHourRemainingKnown bool `json:"five_hour_remaining_known,omitempty"`
+	// FiveHourRemainingPercent is the latest known 5h quota remaining percentage.
+	FiveHourRemainingPercent float64 `json:"five_hour_remaining_percent,omitempty"`
+	// SevenDayRemainingKnown indicates whether SevenDayRemainingPercent is populated.
+	SevenDayRemainingKnown bool `json:"seven_day_remaining_known,omitempty"`
+	// SevenDayRemainingPercent is the latest known 7d quota remaining percentage.
+	SevenDayRemainingPercent float64 `json:"seven_day_remaining_percent,omitempty"`
+	// SnapshotUpdatedAt is when the latest quota percentage snapshot was observed.
+	SnapshotUpdatedAt time.Time `json:"snapshot_updated_at,omitempty"`
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.

@@ -7,8 +7,9 @@ import (
 
 // sessionEntry stores auth binding with expiration.
 type sessionEntry struct {
-	authID    string
-	expiresAt time.Time
+	authID              string
+	expiresAt           time.Time
+	consecutiveFailures int
 }
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
@@ -91,6 +92,71 @@ func (c *SessionCache) Set(sessionID, authID string) {
 		expiresAt: time.Now().Add(c.ttl),
 	}
 	c.mu.Unlock()
+}
+
+func (c *SessionCache) RecordSuccess(sessionID, authID string) bool {
+	if sessionID == "" || authID == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[sessionID]
+	if !ok || entry.authID != authID {
+		return false
+	}
+	entry.consecutiveFailures = 0
+	c.entries[sessionID] = entry
+	return true
+}
+
+func (c *SessionCache) RecordFailure(sessionID, authID string, threshold int) (int, bool) {
+	if sessionID == "" || authID == "" {
+		return 0, false
+	}
+	if threshold <= 0 {
+		threshold = defaultStickyFailureUnbindThreshold
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[sessionID]
+	if !ok || entry.authID != authID {
+		return 0, false
+	}
+	entry.consecutiveFailures++
+	failures := entry.consecutiveFailures
+	if failures >= threshold {
+		delete(c.entries, sessionID)
+		return failures, true
+	}
+	c.entries[sessionID] = entry
+	return failures, false
+}
+
+func (c *SessionCache) FailureCount(sessionID, authID string) int {
+	if sessionID == "" || authID == "" {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, ok := c.entries[sessionID]
+	if !ok || entry.authID != authID {
+		return 0
+	}
+	return entry.consecutiveFailures
+}
+
+func (c *SessionCache) InvalidateIfAuth(sessionID, authID string) bool {
+	if sessionID == "" || authID == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[sessionID]
+	if !ok || entry.authID != authID {
+		return false
+	}
+	delete(c.entries, sessionID)
+	return true
 }
 
 // Invalidate removes a specific session binding.

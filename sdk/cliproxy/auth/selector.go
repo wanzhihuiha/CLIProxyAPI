@@ -435,14 +435,18 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
+	fallback               Selector
+	cache                  *SessionCache
+	activeSessions         *ActiveSessionTracker
+	stickyFailureThreshold int
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback Selector
-	TTL      time.Duration
+	Fallback               Selector
+	TTL                    time.Duration
+	ActiveSessions         *ActiveSessionTracker
+	StickyFailureThreshold int
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -461,9 +465,15 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
+	threshold := cfg.StickyFailureThreshold
+	if threshold <= 0 {
+		threshold = defaultStickyFailureUnbindThreshold
+	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
+		fallback:               cfg.Fallback,
+		cache:                  NewSessionCache(cfg.TTL),
+		activeSessions:         cfg.ActiveSessions,
+		stickyFailureThreshold: threshold,
 	}
 }
 
@@ -490,7 +500,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuthsForSelector(s.fallback, auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
@@ -498,20 +508,43 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	cacheKey := provider + "::" + primaryID + "::" + model
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
+		rebind := false
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				if s.shouldRebindActiveSession(cacheKey, auth.ID, now) {
+					s.cache.Invalidate(cacheKey)
+					fallbackID = ""
+					rebind = true
+					break
+				}
+				s.beginActiveSession(opts.Metadata, cacheKey, auth.ID, now)
+				s.attachStickySession(opts.Metadata, cacheKey, auth.ID)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-		if err != nil {
-			return nil, err
+		if rebind {
+			entry.Infof("session-affinity: active session hard ttl expired, reselecting | session=%s provider=%s model=%s", truncateSessionID(primaryID), provider, model)
+		} else if s.shouldTemporarilyFailover(cacheKey, cachedAuthID) {
+			auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+			if err != nil {
+				return nil, err
+			}
+			s.beginActiveSession(opts.Metadata, cacheKey, auth.ID, now)
+			entry.Infof("session-affinity: cache hit but auth temporarily unavailable, using failover auth without rebinding | session=%s auth=%s sticky_auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, cachedAuthID, provider, model)
+			return auth, nil
+		} else {
+			// Cached auth not available, reselect via fallback selector for even distribution
+			auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+			if err != nil {
+				return nil, err
+			}
+			s.cache.Set(cacheKey, auth.ID)
+			s.beginActiveSession(opts.Metadata, cacheKey, auth.ID, now)
+			s.attachStickySession(opts.Metadata, cacheKey, auth.ID)
+			entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
 		}
-		s.cache.Set(cacheKey, auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-		return auth, nil
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
@@ -519,7 +552,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
+					if s.shouldRebindActiveSession(fallbackKey, auth.ID, now) {
+						s.cache.Invalidate(fallbackKey)
+						break
+					}
 					s.cache.Set(cacheKey, auth.ID)
+					s.moveActiveSession(fallbackKey, cacheKey, auth.ID, now)
+					s.beginActiveSession(opts.Metadata, cacheKey, auth.ID, now)
+					s.attachStickySession(opts.Metadata, cacheKey, auth.ID)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
 				}
@@ -532,8 +572,53 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 	s.cache.Set(cacheKey, auth.ID)
+	s.beginActiveSession(opts.Metadata, cacheKey, auth.ID, now)
+	s.attachStickySession(opts.Metadata, cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) beginActiveSession(meta map[string]any, sessionKey, authID string, now time.Time) {
+	if s == nil || s.activeSessions == nil || meta == nil {
+		return
+	}
+	attachActiveSessionLease(meta, s.activeSessions.Begin(sessionKey, authID, now))
+}
+
+func (s *SessionAffinitySelector) attachStickySession(meta map[string]any, sessionKey, authID string) {
+	if s == nil || s.cache == nil || meta == nil {
+		return
+	}
+	attachStickySessionLease(meta, newStickySessionLease(s.cache, sessionKey, authID, s.stickyFailureThreshold))
+}
+
+func (s *SessionAffinitySelector) shouldTemporarilyFailover(sessionKey, authID string) bool {
+	if s == nil || s.cache == nil {
+		return false
+	}
+	failures := s.cache.FailureCount(sessionKey, authID)
+	return failures > 0 && failures < s.stickyFailureThreshold
+}
+
+func (s *SessionAffinitySelector) shouldRebindActiveSession(sessionKey, authID string, now time.Time) bool {
+	if s == nil || s.activeSessions == nil {
+		return false
+	}
+	return s.activeSessions.ShouldRebind(sessionKey, authID, now)
+}
+
+func (s *SessionAffinitySelector) moveActiveSession(oldSessionKey, newSessionKey, authID string, now time.Time) {
+	if s == nil || s.activeSessions == nil {
+		return
+	}
+	s.activeSessions.MoveSession(oldSessionKey, newSessionKey, authID, now)
+}
+
+func getAvailableAuthsForSelector(selector Selector, auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	if selectorNeedsAllPriorityCandidates(selector) {
+		return getAvailableAuthsWithoutPriority(auths, provider, model, now)
+	}
+	return getAvailableAuths(auths, provider, model, now)
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {

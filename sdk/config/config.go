@@ -14,6 +14,7 @@ type StreamingConfig = internalconfig.StreamingConfig
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type AmpCode = internalconfig.AmpCode
+type CodexQuotaRefreshConfig = internalconfig.CodexQuotaRefreshConfig
 type OAuthModelAlias = internalconfig.OAuthModelAlias
 type PayloadConfig = internalconfig.PayloadConfig
 type PayloadRule = internalconfig.PayloadRule
@@ -32,7 +33,9 @@ type OpenAICompatibilityModel = internalconfig.OpenAICompatibilityModel
 type TLS = internalconfig.TLSConfig
 
 const (
-	DefaultPanelGitHubRepository = internalconfig.DefaultPanelGitHubRepository
+	DefaultPanelGitHubRepository        = internalconfig.DefaultPanelGitHubRepository
+	DefaultCodexQuotaRefreshInterval    = internalconfig.DefaultCodexQuotaRefreshInterval
+	DefaultCodexQuotaRefreshConcurrency = internalconfig.DefaultCodexQuotaRefreshConcurrency
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }

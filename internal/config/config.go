@@ -20,9 +20,11 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
-	DefaultPprofAddr             = "127.0.0.1:8316"
-	DefaultAuthDir               = "~/.cli-proxy-api"
+	DefaultPanelGitHubRepository        = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	DefaultPprofAddr                    = "127.0.0.1:8316"
+	DefaultAuthDir                      = "~/.cli-proxy-api"
+	DefaultCodexQuotaRefreshInterval    = "10m"
+	DefaultCodexQuotaRefreshConcurrency = 2
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -80,6 +82,9 @@ type Config struct {
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
+
+	// CodexQuotaRefresh controls proactive ChatGPT wham/usage quota snapshot refresh.
+	CodexQuotaRefresh CodexQuotaRefreshConfig `yaml:"codex-quota-refresh" json:"codex-quota-refresh"`
 
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
@@ -190,6 +195,30 @@ type PprofConfig struct {
 	Addr string `yaml:"addr" json:"addr"`
 }
 
+// CodexQuotaRefreshConfig configures proactive Codex account quota snapshot refresh.
+type CodexQuotaRefreshConfig struct {
+	// Enabled toggles the background quota refresh worker. Defaults to true.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Interval controls periodic snapshot refresh cadence. Defaults to 10m.
+	Interval string `yaml:"interval" json:"interval"`
+	// MaxConcurrency limits concurrent wham/usage refresh requests. Defaults to 2.
+	MaxConcurrency int `yaml:"max-concurrency" json:"max-concurrency"`
+}
+
+// NormalizeCodexQuotaRefreshConfig applies in-memory defaults and bounds.
+func (cfg *Config) NormalizeCodexQuotaRefreshConfig() {
+	if cfg == nil {
+		return
+	}
+	cfg.CodexQuotaRefresh.Interval = strings.TrimSpace(cfg.CodexQuotaRefresh.Interval)
+	if cfg.CodexQuotaRefresh.Interval == "" {
+		cfg.CodexQuotaRefresh.Interval = DefaultCodexQuotaRefreshInterval
+	}
+	if cfg.CodexQuotaRefresh.MaxConcurrency <= 0 {
+		cfg.CodexQuotaRefresh.MaxConcurrency = DefaultCodexQuotaRefreshConcurrency
+	}
+}
+
 // RemoteManagement holds management API configuration under 'remote-management'.
 type RemoteManagement struct {
 	// AllowRemote toggles remote (non-localhost) access to management API.
@@ -224,7 +253,7 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first".
+	// Supported values: "round-robin" (default), "fill-first", "sticky-quota-protect".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
@@ -641,6 +670,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.UsageStatisticsEnabled = false
 	cfg.RedisUsageQueueRetentionSeconds = 60
 	cfg.DisableCooling = false
+	cfg.CodexQuotaRefresh.Enabled = true
+	cfg.CodexQuotaRefresh.Interval = DefaultCodexQuotaRefreshInterval
+	cfg.CodexQuotaRefresh.MaxConcurrency = DefaultCodexQuotaRefreshConcurrency
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
@@ -712,6 +744,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+	cfg.NormalizeCodexQuotaRefreshConfig()
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
@@ -1384,6 +1417,8 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 			return node.Value == DefaultPanelGitHubRepository
 		case "routing.strategy":
 			return node.Value == "round-robin"
+		case "codex-quota-refresh.interval":
+			return node.Value == DefaultCodexQuotaRefreshInterval
 		}
 	}
 
@@ -1392,6 +1427,16 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "error-logs-max-files":
 			return node.Value == "10"
+		case "codex-quota-refresh.max-concurrency":
+			return node.Value == "2"
+		}
+	}
+
+	// Check boolean defaults
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+		switch fullPath {
+		case "codex-quota-refresh.enabled":
+			return node.Value == "true"
 		}
 	}
 

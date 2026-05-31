@@ -12,6 +12,10 @@ logs/*
 conv/*
 temp/*
 refs/*
+dist/
+vendor/
+test-output
+*.tar.gz
 
 # Storage backends
 pgstore/*
@@ -42,6 +46,7 @@ GEMINI.md
 .agents/*
 .opencode/*
 .idea/*
+goal-*/
 .beads/*
 .bmad/*
 _bmad/*
@@ -51,3 +56,6 @@ _bmad-output/*
 .DS_Store
 ._*
 .gocache/
+
+# Local deployment experiments
+docker-compose.sticky-test.yml

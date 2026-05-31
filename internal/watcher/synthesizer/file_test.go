@@ -432,6 +432,40 @@ func TestSynthesizeGeminiVirtualAuths_NilInputs(t *testing.T) {
 	}
 }
 
+func TestSynthesizeAuthFile_AppliesQuotaMetadata(t *testing.T) {
+	authDir := t.TempDir()
+	fullPath := filepath.Join(authDir, "codex.json")
+	observedAt := time.Date(2026, 5, 31, 8, 30, 0, 0, time.UTC)
+	data := []byte(`{
+		"type": "codex",
+		"quota": {
+			"five_hour_remaining_known": true,
+			"five_hour_remaining_percent": 77,
+			"seven_day_remaining_known": true,
+			"seven_day_remaining_percent": 92,
+			"snapshot_updated_at": "` + observedAt.Format(time.RFC3339Nano) + `"
+		}
+	}`)
+
+	auths := SynthesizeAuthFile(&SynthesisContext{
+		AuthDir: authDir,
+		Now:     observedAt,
+	}, fullPath, data)
+	if len(auths) != 1 {
+		t.Fatalf("expected one auth, got %d", len(auths))
+	}
+	auth := auths[0]
+	if !auth.Quota.FiveHourRemainingKnown || auth.Quota.FiveHourRemainingPercent != 77 {
+		t.Fatalf("5h quota = (%v, %v), want known 77", auth.Quota.FiveHourRemainingKnown, auth.Quota.FiveHourRemainingPercent)
+	}
+	if !auth.Quota.SevenDayRemainingKnown || auth.Quota.SevenDayRemainingPercent != 92 {
+		t.Fatalf("7d quota = (%v, %v), want known 92", auth.Quota.SevenDayRemainingKnown, auth.Quota.SevenDayRemainingPercent)
+	}
+	if !auth.Quota.SnapshotUpdatedAt.Equal(observedAt) {
+		t.Fatalf("snapshot_updated_at = %s, want %s", auth.Quota.SnapshotUpdatedAt, observedAt)
+	}
+}
+
 func TestSynthesizeGeminiVirtualAuths_SingleProject(t *testing.T) {
 	now := time.Now()
 	primary := &coreauth.Auth{

@@ -190,6 +190,9 @@ type Manager struct {
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
 
+	codexQuotaRefreshCancel context.CancelFunc
+	codexQuotaRefreshLoop   *codexQuotaRefreshLoop
+
 	requestPrepareLocks sync.Map
 }
 
@@ -698,6 +701,50 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 	return available, nil
 }
 
+func (m *Manager) availableAuthsForRouteModelWithoutPriority(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+	if len(auths) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+
+	available := make([]*Auth, 0, len(auths))
+	cooldownCount := 0
+	var earliest time.Time
+	for _, candidate := range auths {
+		checkModel := m.selectionModelForAuth(candidate, routeModel)
+		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
+		if !blocked {
+			available = append(available, candidate)
+			continue
+		}
+		if reason == blockReasonCooldown {
+			cooldownCount++
+			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
+				earliest = next
+			}
+		}
+	}
+
+	if len(available) == 0 {
+		if cooldownCount == len(auths) && !earliest.IsZero() {
+			providerForError := provider
+			if providerForError == "mixed" {
+				providerForError = ""
+			}
+			resetIn := earliest.Sub(now)
+			if resetIn < 0 {
+				resetIn = 0
+			}
+			return nil, newModelCooldownError(routeModel, providerForError, resetIn)
+		}
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+
+	if len(available) > 1 {
+		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+	}
+	return available, nil
+}
+
 func selectionArgForSelector(selector Selector, routeModel string) string {
 	if isBuiltInSelector(selector) {
 		return ""
@@ -815,10 +862,11 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, activeLease *ActiveSessionLease, stickyLease *stickySessionLease) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		defer releaseActiveSessionLease(activeLease)
 		var failed bool
 		forward := true
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
@@ -828,7 +876,9 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				m.MarkResult(ctx, result)
+				recordStickySessionResult(stickyLease, result)
 			}
 			if !forward {
 				return false
@@ -858,13 +908,15 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true}
+			m.MarkResult(ctx, result)
+			recordStickySessionResult(stickyLease, result)
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool, activeLease *ActiveSessionLease, stickyLease *stickySessionLease) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
@@ -950,7 +1002,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
+		m.UpdateQuotaSnapshotFromHeaders(ctx, auth.ID, provider, resultModel, streamResult.Headers)
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, activeLease, stickyLease), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -1152,6 +1205,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	m.queueCodexQuotaRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1186,6 +1240,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	m.queueCodexQuotaRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1208,6 +1263,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
+		ApplyPersistentRuntimeMetadata(auth)
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}
@@ -1333,6 +1389,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = ensureExecutionMetadata(opts)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
@@ -1356,6 +1413,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		activeLease := takeActiveSessionLeaseFromMetadata(pickOpts.Metadata)
+		stickyLease := takeStickySessionLeaseFromMetadata(pickOpts.Metadata)
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
@@ -1371,6 +1430,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			releaseActiveSessionLease(activeLease)
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1382,6 +1442,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
+			recordStickySessionResult(stickyLease, result)
+			releaseActiveSessionLease(activeLease)
 			lastErr = errPrepare
 			continue
 		}
@@ -1394,6 +1456,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					releaseActiveSessionLease(activeLease)
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				result.Error = &Error{Message: errExec.Error()}
@@ -1405,18 +1468,27 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					recordStickySessionResult(stickyLease, result)
+					releaseActiveSessionLease(activeLease)
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			m.UpdateQuotaSnapshotFromHeaders(execCtx, auth.ID, provider, resultModel, resp.Headers)
+			recordStickySessionResult(stickyLease, result)
+			releaseActiveSessionLease(activeLease)
 			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
+				recordStickySessionError(stickyLease, authErr)
+				releaseActiveSessionLease(activeLease)
 				return cliproxyexecutor.Response{}, authErr
 			}
+			recordStickySessionError(stickyLease, authErr)
+			releaseActiveSessionLease(activeLease)
 			lastErr = authErr
 			if homeMode {
 				homeAuthCount++
@@ -1432,6 +1504,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = ensureExecutionMetadata(opts)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
@@ -1455,6 +1528,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		activeLease := takeActiveSessionLeaseFromMetadata(pickOpts.Metadata)
+		stickyLease := takeStickySessionLeaseFromMetadata(pickOpts.Metadata)
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
@@ -1470,6 +1545,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			releaseActiveSessionLease(activeLease)
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1481,6 +1557,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
+			recordStickySessionResult(stickyLease, result)
+			releaseActiveSessionLease(activeLease)
 			lastErr = errPrepare
 			continue
 		}
@@ -1493,6 +1571,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					releaseActiveSessionLease(activeLease)
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				result.Error = &Error{Message: errExec.Error()}
@@ -1504,18 +1583,27 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					recordStickySessionResult(stickyLease, result)
+					releaseActiveSessionLease(activeLease)
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			m.UpdateQuotaSnapshotFromHeaders(execCtx, auth.ID, provider, resultModel, resp.Headers)
+			recordStickySessionResult(stickyLease, result)
+			releaseActiveSessionLease(activeLease)
 			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
+				recordStickySessionError(stickyLease, authErr)
+				releaseActiveSessionLease(activeLease)
 				return cliproxyexecutor.Response{}, authErr
 			}
+			recordStickySessionError(stickyLease, authErr)
+			releaseActiveSessionLease(activeLease)
 			lastErr = authErr
 			if homeMode {
 				homeAuthCount++
@@ -1531,6 +1619,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = ensureExecutionMetadata(opts)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
@@ -1554,6 +1643,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, errPick
 		}
+		activeLease := takeActiveSessionLeaseFromMetadata(pickOpts.Metadata)
+		stickyLease := takeStickySessionLeaseFromMetadata(pickOpts.Metadata)
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
@@ -1567,6 +1658,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			releaseActiveSessionLease(activeLease)
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1578,17 +1670,24 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
+			recordStickySessionResult(stickyLease, result)
+			releaseActiveSessionLease(activeLease)
 			lastErr = errPrepare
 			continue
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled, activeLease, stickyLease)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
+				releaseActiveSessionLease(activeLease)
 				return nil, errCtx
 			}
 			if isRequestInvalidError(errStream) {
+				recordStickySessionError(stickyLease, errStream)
+				releaseActiveSessionLease(activeLease)
 				return nil, errStream
 			}
+			recordStickySessionError(stickyLease, errStream)
+			releaseActiveSessionLease(activeLease)
 			lastErr = errStream
 			if homeMode {
 				homeAuthCount++
@@ -1617,6 +1716,13 @@ func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel 
 	}
 	meta[cliproxyexecutor.RequestedModelMetadataKey] = requestedModel
 	opts.Metadata = meta
+	return opts
+}
+
+func ensureExecutionMetadata(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	if opts.Metadata == nil {
+		opts.Metadata = make(map[string]any)
+	}
 	return opts
 }
 
@@ -2381,12 +2487,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								}
 							}
 							state.NextRetryAfter = next
-							state.Quota = QuotaState{
-								Exceeded:      true,
-								Reason:        "quota",
-								NextRecoverAt: next,
-								BackoffLevel:  backoffLevel,
-							}
+							state.Quota.Exceeded = true
+							state.Quota.Reason = "quota"
+							state.Quota.NextRecoverAt = next
+							state.Quota.BackoffLevel = backoffLevel
 							if !disableCooling {
 								suspendReason = "quota"
 								shouldSuspendModel = true
@@ -2460,7 +2564,7 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.StatusMessage = ""
 	state.NextRetryAfter = time.Time{}
 	state.LastError = nil
-	state.Quota = QuotaState{}
+	clearQuotaCooldownFields(&state.Quota)
 	state.UpdatedAt = now
 }
 
@@ -2557,7 +2661,7 @@ func clearAggregatedAvailability(auth *Auth) {
 	}
 	auth.Unavailable = false
 	auth.NextRetryAfter = time.Time{}
-	auth.Quota = QuotaState{}
+	clearQuotaCooldownFields(&auth.Quota)
 }
 
 func hasModelError(auth *Auth, now time.Time) bool {
@@ -2587,10 +2691,7 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.Unavailable = false
 	auth.Status = StatusActive
 	auth.StatusMessage = ""
-	auth.Quota.Exceeded = false
-	auth.Quota.Reason = ""
-	auth.Quota.NextRecoverAt = time.Time{}
-	auth.Quota.BackoffLevel = 0
+	clearQuotaCooldownFields(&auth.Quota)
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
 	auth.UpdatedAt = now
@@ -3047,7 +3148,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+	var available []*Auth
+	var errAvailable error
+	if selectorNeedsAllPriorityCandidates(m.selector) {
+		available, errAvailable = m.availableAuthsForRouteModelWithoutPriority(candidates, provider, model, time.Now())
+	} else {
+		available, errAvailable = m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+	}
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
@@ -3199,7 +3306,13 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	var available []*Auth
+	var errAvailable error
+	if selectorNeedsAllPriorityCandidates(m.selector) {
+		available, errAvailable = m.availableAuthsForRouteModelWithoutPriority(candidates, "mixed", model, time.Now())
+	} else {
+		available, errAvailable = m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	}
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
@@ -3842,7 +3955,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		if len(models) == 0 {
 			continue
 		}
-		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, models, len(models) > 1)
+		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, models, len(models) > 1, nil, nil)
 		if errStream != nil {
 			continue
 		}
@@ -3863,11 +3976,13 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 			return nil
 		}
 	}
+	authToPersist := auth.Clone()
+	MergePersistentRuntimeMetadata(authToPersist)
 	// Skip persistence when metadata is absent (e.g., runtime-only auths).
-	if auth.Metadata == nil {
+	if authToPersist.Metadata == nil {
 		return nil
 	}
-	_, err := m.store.Save(ctx, auth)
+	_, err := m.store.Save(ctx, authToPersist)
 	return err
 }
 
