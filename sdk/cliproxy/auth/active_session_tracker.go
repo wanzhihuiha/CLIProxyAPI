@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -177,6 +178,25 @@ func (t *ActiveSessionTracker) MoveSession(oldSessionKey, newSessionKey, authID 
 	t.decrementCountLocked(authID)
 }
 
+func (t *ActiveSessionTracker) InvalidateAuth(authID string) {
+	if t == nil || authID == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for key, entry := range t.entries {
+		if entry != nil && entry.authID == authID {
+			delete(t.entries, key)
+		}
+	}
+	for key := range t.expired {
+		if activeSessionEntryKeyAuthID(key) == authID {
+			delete(t.expired, key)
+		}
+	}
+	delete(t.counts, authID)
+}
+
 func (t *ActiveSessionTracker) Count(authID string, now time.Time) int {
 	if t == nil || authID == "" {
 		return 0
@@ -310,6 +330,14 @@ func (t *ActiveSessionTracker) decrementCountLocked(authID string) {
 
 func activeSessionEntryKey(sessionKey, authID string) string {
 	return sessionKey + "\x00" + authID
+}
+
+func activeSessionEntryKeyAuthID(key string) string {
+	idx := strings.LastIndexByte(key, 0)
+	if idx < 0 || idx+1 >= len(key) {
+		return ""
+	}
+	return key[idx+1:]
 }
 
 func normalizeActiveSessionTime(now time.Time) time.Time {

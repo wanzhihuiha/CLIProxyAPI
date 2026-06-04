@@ -652,6 +652,9 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	if s.cache != nil {
 		s.cache.InvalidateAuth(authID)
 	}
+	if s.activeSessions != nil {
+		s.activeSessions.InvalidateAuth(authID)
+	}
 }
 
 // ExtractSessionID extracts session identifier from multiple sources.
@@ -701,6 +704,9 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 
 	// 3. Session_id header (Codex)
 	if headers != nil {
+		if sid := headers.Get("Session-Id"); sid != "" {
+			return "codex:" + sid, ""
+		}
 		if sid := headers.Get("Session_id"); sid != "" {
 			return "codex:" + sid, ""
 		}

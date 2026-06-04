@@ -115,6 +115,19 @@ func (m *Manager) queueCodexQuotaRefreshReschedule(authID string) {
 	loop.queueReschedule(authID)
 }
 
+func (m *Manager) queueCodexQuotaRefreshUnschedule(authID string) {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	m.mu.RLock()
+	loop := m.codexQuotaRefreshLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
+	}
+	loop.remove(authID)
+}
+
 func newCodexQuotaRefreshLoop(manager *Manager, interval time.Duration, concurrency int) *codexQuotaRefreshLoop {
 	if interval <= 0 {
 		interval = defaultCodexQuotaRefreshInterval

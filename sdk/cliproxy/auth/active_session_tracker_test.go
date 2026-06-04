@@ -57,6 +57,30 @@ func TestActiveSessionTracker_HardTTLWaitsForInFlight(t *testing.T) {
 	}
 }
 
+func TestActiveSessionTracker_InvalidateAuthClearsActiveSessions(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 5, 30, 10, 0, 0, 0, time.UTC)
+	tracker := NewActiveSessionTracker(ActiveSessionConfig{
+		IdleTimeout: time.Hour,
+		HardTTL:     time.Hour,
+	})
+
+	leaseA := tracker.Begin("session-a", "auth-a", base)
+	tracker.Begin("session-b", "auth-a", base)
+	tracker.Begin("session-c", "auth-b", base)
+
+	tracker.InvalidateAuth("auth-a")
+	leaseA.Release()
+
+	if snapshot := tracker.Snapshot("auth-a", base); snapshot.ActiveSessions != 0 || snapshot.InFlight != 0 {
+		t.Fatalf("Snapshot(auth-a) after invalidate = %+v, want empty", snapshot)
+	}
+	if snapshot := tracker.Snapshot("auth-b", base); snapshot.ActiveSessions != 1 || snapshot.InFlight != 1 {
+		t.Fatalf("Snapshot(auth-b) after invalidate auth-a = %+v, want active=1 in_flight=1", snapshot)
+	}
+}
+
 func TestStickyQuotaProtectSelectorPick_ActiveSessionCountSpreadsNewSessions(t *testing.T) {
 	t.Parallel()
 
